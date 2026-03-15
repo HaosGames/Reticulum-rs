@@ -1,6 +1,7 @@
 use std::sync::Once;
 use std::time::Duration;
 
+use log::debug;
 use rand_core::OsRng;
 use reticulum::{
     destination::DestinationName,
@@ -202,4 +203,92 @@ async fn message_proof_over_remote_link() {
             unreachable!("Timeout. Expected LinkEvent::Proof was not emitted");
         },
     }
+}
+
+#[tokio::test]
+async fn request_response_over_link() {
+    setup();
+
+    let transport_a = build_transport("a", "127.0.0.1:8481", &[]).await;
+    let _transport_b =
+        build_transport_full("b", "127.0.0.1:8482", &["127.0.0.1:8481"], true)
+        .await;
+    let mut transport_c =
+        build_transport("c", "127.0.0.1:8483", &["127.0.0.1:8482"])
+        .await;
+
+    let id_c = PrivateIdentity::new_from_name("c");
+    let dest_c = transport_c
+        .add_destination(id_c, DestinationName::new("test", "link_to"))
+        .await;
+    let dest_c_hash = dest_c.lock().await.desc.address_hash;
+
+    transport_c.send_announce(&dest_c, None).await;
+
+    transport_a.recv_announces().await.recv().await.unwrap();
+    let link = transport_a.link(dest_c.lock().await.desc).await;
+    let link_id_a = link.lock().await.id().clone();
+
+    time::sleep(Duration::from_secs(5)).await;
+
+    // Send Request
+    let message = "foo";
+    let packet = link.lock().await.data_packet(message.as_bytes()).unwrap();
+    transport_a.send_packet(packet).await;
+
+    // Wait for Request and gather link_id
+    let mut in_link_events_c = transport_c.in_link_events();
+    let event_loop = tokio::spawn(async move {
+        loop {
+            let data= in_link_events_c.recv().await.unwrap();
+            let destination = data.address_hash;
+            let link_id = data.id;
+
+            if destination == dest_c_hash {
+                if let LinkEvent::Data(data) = data.event {
+                    assert_eq!(data.as_slice(), message.as_bytes());
+                } else {
+                    unreachable!("Did not receive correcct LinkEvent Type while waiting for request");
+                }
+                return link_id;
+            }
+        }
+    });
+    let id = tokio::select! {
+        id = event_loop => id,
+        _ = time::sleep(Duration::from_secs(10)) => {
+            unreachable!("Timeout. Expected LinkEvent was not emitted");
+        },
+    }.unwrap();
+
+    // Send Response
+    let message = "bar";
+    let link = transport_c.find_in_link(&id).await.unwrap();
+    let packet = link.lock().await.data_packet(message.as_bytes()).unwrap();
+    transport_c.send_packet(packet).await;
+
+    // Wait for Response and gather link_id
+    let mut out_link_events_a = transport_a.out_link_events();
+    let event_loop = tokio::spawn(async move {
+        loop {
+            let data= out_link_events_a.recv().await.unwrap();
+            let destination = data.address_hash;
+            let link_id = data.id;
+
+            if destination == dest_c_hash && id == link_id {
+                if let LinkEvent::Data(data) = data.event {
+                    assert_eq!(data.as_slice(), message.as_bytes());
+                } else {
+                    unreachable!("Did not receive correcct LinkEvent Type while waiting for response");
+                }
+                return link_id;
+            }
+        }
+    });
+    let id = tokio::select! {
+        id = event_loop => id,
+        _ = time::sleep(Duration::from_secs(10)) => {
+            unreachable!("Timeout. Expected LinkEvent was not emitted");
+        },
+    }.unwrap();
 }
